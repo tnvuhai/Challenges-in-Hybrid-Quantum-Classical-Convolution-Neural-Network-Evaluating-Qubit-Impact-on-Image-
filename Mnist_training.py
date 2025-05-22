@@ -1,0 +1,215 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader, random_split
+from sklearn.metrics import accuracy_score, precision_score, f1_score
+import matplotlib.pyplot as plt
+import numpy as np
+import pennylane as qml
+from pennylane import numpy as pnp
+from torchvision.datasets import MNIST
+import pandas as pd
+from datetime import datetime
+import psutil
+from torch.utils.data import Subset
+
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Parameters
+img_size = 12
+batch_size = 16
+epochs = 5
+num_runs = 5
+qubit_list = [2, 4, 6, 8]
+TARGET_CLASSES = [0, 1]
+
+
+
+# Load Data
+transform = transforms.Compose([
+    transforms.Grayscale(),
+    transforms.Resize((img_size, img_size)),
+    transforms.ToTensor()
+])
+
+# dataset = datasets.ImageFolder(root="./Data", transform=transform)
+# train_len = int(0.8 * len(dataset))
+# val_len = len(dataset) - train_len
+# train_data, val_data = random_split(dataset, [train_len, val_len])
+# train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+# val_loader = DataLoader(val_data, batch_size=batch_size)
+
+
+# Tải dữ liệu
+train_dataset = datasets.MNIST(root='./Mnist',train=True, download=True, transform=transform)
+test_dataset = datasets.MNIST(root='./Mnist',train=False, download=True, transform=transform)
+
+# Lọc ảnh lấy theo target_classes
+def filter_classes(dataset):
+    indices = [i for i, (_, label) in enumerate(dataset) if label in TARGET_CLASSES]
+    subset = Subset(dataset, indices)
+    return subset
+
+train_dataset = filter_classes(train_dataset)
+test_dataset = filter_classes(test_dataset)
+
+# Thay đổi label về 0, 1
+def relabel(subset):
+    subset.dataset.targets = np.array(subset.dataset.targets)
+    for i in range(len(subset)):
+        label = subset.dataset.targets[subset.indices[i]]
+        if label == 0:
+            subset.dataset.targets[subset.indices[i]] = 0  # 0
+        elif label == 1:
+            subset.dataset.targets[subset.indices[i]] = 1  # 1
+    return subset
+
+train_dataset = relabel(train_dataset)
+test_dataset = relabel(test_dataset)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+
+
+# Quantum layer
+class QuantumLayer(nn.Module):
+    def __init__(self, n_qubits):
+        super().__init__()
+        dev = qml.device("default.qubit", wires=n_qubits)
+
+        #weight_shapes = {"weights": (1, n_qubits)}
+
+        @qml.qnode(dev, interface="torch", diff_method="backprop")
+        def circuit(inputs, weights):
+            for i in range(n_qubits):
+                qml.RX(np.pi * inputs[i], wires=i)
+                qml.RZ(np.pi * inputs[i], wires=i)
+            qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
+            return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+        self.qnode = circuit
+        self.weight = nn.Parameter(torch.rand((1, n_qubits)))  # This will be trained!
+
+    def forward(self, x):
+        outputs = []
+        for i in range(x.shape[0]):
+            out = self.qnode(x[i], self.weight)
+            out_tensor = torch.tensor(out, dtype=torch.float32).to(x.device)
+            outputs.append(out_tensor)
+        return torch.stack(outputs)
+
+# Model
+class HQCNN(nn.Module):
+    def __init__(self, n_qubits):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 12, 3),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(12 * ((img_size - 2) // 2) ** 2, n_qubits),
+            nn.Tanh()
+        )
+        self.q_layer = QuantumLayer(n_qubits)
+        self.classifier = nn.Sequential(
+            nn.Linear(n_qubits, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.q_layer(x)
+        x = self.classifier(x)
+        return x
+
+# Training and evaluation
+def train_and_evaluate(n_qubits, num_runs):
+    model = HQCNN(n_qubits).to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+    for epoch in range(epochs):
+        model.train()
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.float().to(device)
+            labels = labels.unsqueeze(1)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch}, loss: {loss}")
+
+    model.eval()
+    y_true, y_pred, losses = [], [], []
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.float().to(device)
+            labels = labels.unsqueeze(1)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            losses.append(loss.item())
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend((outputs.cpu().numpy() > 0.5).astype(int).flatten())
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    avg_loss = np.mean(losses)
+
+    return acc, prec, f1, avg_loss
+
+# Run experiments
+results = {"qubits": [], "accuracy_mean": [], "accuracy_std": [],
+           "precision_mean": [], "precision_std": [], "f1_mean": [], "f1_std": [],
+           "loss_mean": [], "loss_std": [], "Ram_usage": [], "Mean_time":[]}
+
+for nq in qubit_list:
+    accs, precs, f1s, losses = [], [], [], []
+    TimeList, RamList = [], []
+    print(f"Qubits: {nq}")
+    for _ in range(num_runs):
+        print(f"Num runs: {_}")
+        start_time = datetime.now()
+        acc, prec, f1, loss = train_and_evaluate(nq,_)
+        ram_after = psutil.Process(os.getpid()).memory_info().rss
+        end_time = datetime.now()
+        elapsed = end_time - start_time
+        ram_delta_mb = (ram_after) / 1024 / 1024
+        RamList.append(ram_delta_mb)
+        accs.append(acc)
+        precs.append(prec)
+        f1s.append(f1)
+        losses.append(loss)
+        TimeList.append(elapsed)
+    results["qubits"].append(nq)
+    results["accuracy_mean"].append(np.mean(accs))
+    results["accuracy_std"].append(np.std(accs))
+    results["precision_mean"].append(np.mean(precs))
+    results["precision_std"].append(np.std(precs))
+    results["f1_mean"].append(np.mean(f1s))
+    results["f1_std"].append(np.std(f1s))
+    results["loss_mean"].append(np.mean(losses))
+    results["loss_std"].append(np.std(losses))
+    results["Mean_time"].append(str(np.mean(TimeList)))
+    results["Ram_usage"].append(np.mean(RamList))
+
+Df = pd.DataFrame(results)
+Df.to_excel("ResultMNIST.xlsx")
+
+# Plotting
+plt.errorbar(results["qubits"], results["accuracy_mean"], yerr=results["accuracy_std"], label="Accuracy", capsize=5)
+plt.errorbar(results["qubits"], results["precision_mean"], yerr=results["precision_std"], label="Precision", capsize=5)
+plt.errorbar(results["qubits"], results["loss_mean"], yerr=results["loss_std"], label="Loss", capsize=5)
+plt.xlabel("Number of Qubits")
+plt.ylabel("Metric Value")
+plt.title("Hybrid CQCNN Performance vs Number of Qubits in custom MNIST")
+plt.legend()
+plt.grid(True)
+plt.savefig("ResultMNIST.png",dpi=300)
+plt.show()
