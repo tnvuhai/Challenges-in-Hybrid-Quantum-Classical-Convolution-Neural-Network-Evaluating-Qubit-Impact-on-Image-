@@ -31,11 +31,8 @@ transform = transforms.Compose([
     transforms.Grayscale(),
     transforms.Resize((img_size, img_size)),
     transforms.ToTensor()
-    # transforms.ToTensor(),
-    # transforms.Normalize((0.5,), (0.5,))
 ])
 
-# CLASS_NAMES = ['A', 'B']
 TARGET_CLASSES = [1, 2]
 
 
@@ -75,68 +72,26 @@ class QuantumLayer(nn.Module):
         super().__init__()
         dev = qml.device("default.qubit", wires=n_qubits)
 
-        # weight_shapes = {"weights": (1, n_qubits)}
-
         @qml.qnode(dev, interface="torch", diff_method="backprop")
         def circuit(inputs, weights):
             for i in range(n_qubits):
                 qml.RX(np.pi * inputs[i], wires=i)
                 qml.RZ(np.pi * inputs[i], wires=i)
             qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
-            # for i in range(n_qubits - 1):
-            #     qml.CNOT(wires=[i, i + 1])
-            # qml.CNOT(wires=[n_qubits - 1, 0])
             return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-        # def circuit(inputs, weights):
-        #     qml.AngleEmbedding(inputs,wires=range(n_qubits))
-        #     qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
-        #     return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-        
         self.qnode = circuit
-        self.weight = nn.Parameter(torch.rand((1, n_qubits)))  # This will be trained!
+        self.weight = nn.Parameter(torch.rand((1, n_qubits))) 
         
 
     def forward(self, x):
         outputs = []
         for i in range(x.shape[0]):
             out = self.qnode(x[i], self.weight)
-            #out_tensor = out.to(dtype=torch.float32, device=x.device)
             out_tensor = torch.tensor(out, dtype=torch.float32).to(x.device)
             outputs.append(out_tensor)
         return torch.stack(outputs)
 
 
-# Model
-# class HQCNN(nn.Module):
-#     def __init__(self, n_qubits):
-#         super().__init__()
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(3, 12, 5),
-#             nn.BatchNorm2d(12),
-#             nn.ReLU(),
-
-#             nn.Conv2d(12, 24, 5),
-#             nn.BatchNorm2d(24),
-#             nn.ReLU(),
-#             nn.MaxPool2d(2, 2),
-#             nn.Dropout2d(),
-#             nn.Flatten(),
-#             nn.Linear(96, 48),
-#             nn.ReLU(),
-#             nn.Linear(48, n_qubits),
-#             nn.Tanh()
-#         )
-#         self.q_layer = QuantumLayer(n_qubits)
-#         self.classifier = nn.Sequential(
-#             nn.Linear(n_qubits, 1),
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, x):
-#         x = self.conv(x)
-#         x = self.q_layer(x)
-#         x = self.classifier(x)
-#         return x
 
 class HQCNN(nn.Module):
     def __init__(self, n_qubits):
